@@ -1,0 +1,174 @@
+name: 'Bob Enqueue'
+author: 'Terracotta-OSS'
+description: |-
+  Enqueue a Bob AI review/summary/triage request from any GitHub repository.
+  Writes a JSON job descriptor to a queue repo via the GitHub Contents API.
+  An in-house CI poller picks it up and runs the actual review on the target PR.
+
+inputs:
+  queue_repo:
+    description: |-
+      Full name (owner/repo) of the job queue repository.
+      Defaults to Terracotta-OSS/pr-review-queue.
+    required: false
+    default: 'Terracotta-OSS/pr-review-queue'
+
+  queue_token:
+    description: |-
+      Token with `contents: write` permission on queue_repo.
+      Use a fine-grained PAT scoped to queue_repo only — nothing broader is needed.
+    required: true
+
+  comment:
+    description: |-
+      The issue_comment body that triggered the workflow.
+      Used to resolve the command (review / summary / triage).
+    required: true
+
+  max_cost_review:
+    description: 'Maximum Bobcoins for a /review run.'
+    required: false
+    default: '5'
+
+  max_cost_summary:
+    description: 'Maximum Bobcoins for a /summary run.'
+    required: false
+    default: '2'
+
+  max_cost_triage:
+    description: 'Maximum Bobcoins for a /triage run.'
+    required: false
+    default: '2'
+
+outputs:
+  job_file:
+    description: 'Path of the committed job descriptor, e.g. jobs/20260101-120000-<uuid>.json'
+    value: '${{ steps.enqueue.outputs.job_file }}'
+
+  command:
+    description: 'Resolved command: review | summary | triage'
+    value: '${{ steps.parse.outputs.command }}'
+
+runs:
+  using: 'composite'
+  steps:
+
+    # ── 1. Resolve command from comment body ─────────────────────────────────
+    - name: 'Parse command'
+      id: 'parse'
+      shell: bash
+      env:
+        COMMENT: '${{ inputs.comment }}'
+      run: |
+        set -euo pipefail
+        if   echo "${COMMENT}" | grep -qF '@bobshell /review';  then CMD=review
+        elif echo "${COMMENT}" | grep -qF '@bobshell /summary'; then CMD=summary
+        elif echo "${COMMENT}" | grep -qF '@bobshell /triage';  then CMD=triage
+        else
+          echo "::error::No recognised @bobshell command found (/review, /summary, /triage). Nothing enqueued."
+          exit 1
+        fi
+        echo "command=${CMD}" >> "${GITHUB_OUTPUT}"
+        echo "Resolved command: ${CMD}"
+
+    # ── 2. Write job descriptor to queue repo ────────────────────────────────
+    - name: 'Enqueue job'
+      id: 'enqueue'
+      shell: bash
+      env:
+        QUEUE_REPO:       '${{ inputs.queue_repo }}'
+        QUEUE_TOKEN:      '${{ inputs.queue_token }}'
+        COMMAND:          '${{ steps.parse.outputs.command }}'
+        TARGET_ORG:       '${{ github.repository_owner }}'
+        TARGET_REPO_NAME: '${{ github.event.repository.name }}'
+        PR_NUMBER:        '${{ github.event.issue.number }}'
+        ACTOR:            '${{ github.actor }}'
+        ISSUE_TITLE:      '${{ github.event.issue.title }}'
+        MAX_COST_REVIEW:  '${{ inputs.max_cost_review }}'
+        MAX_COST_SUMMARY: '${{ inputs.max_cost_summary }}'
+        MAX_COST_TRIAGE:  '${{ inputs.max_cost_triage }}'
+        TARGET_GITHUB_HOST: 'https://api.github.com'
+      run: |
+        set -euo pipefail
+
+        # Lexicographically sortable unique filename → natural arrival order for the poller
+        TIMESTAMP="$(date -u +%Y%m%d-%H%M%S)"
+        UUID="$(cat /proc/sys/kernel/random/uuid 2>/dev/null \
+               || python3 -c 'import uuid; print(uuid.uuid4())')"
+        JOB_FILE="jobs/${TIMESTAMP}-${UUID}.json"
+
+        # Build JSON entirely inside jq — no shell interpolation inside JSON values
+        PAYLOAD="$(jq -n \
+          --arg  command            "${COMMAND}" \
+          --arg  target_org         "${TARGET_ORG}" \
+          --arg  target_repo        "${TARGET_REPO_NAME}" \
+          --argjson pr_number       "${PR_NUMBER}" \
+          --arg  actor              "${ACTOR}" \
+          --arg  issue_title        "${ISSUE_TITLE}" \
+          --arg  target_github_host "${TARGET_GITHUB_HOST}" \
+          --argjson max_cost_review  "${MAX_COST_REVIEW}" \
+          --argjson max_cost_summary "${MAX_COST_SUMMARY}" \
+          --argjson max_cost_triage  "${MAX_COST_TRIAGE}" \
+          --arg  source_run_url     "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" \
+          '{
+            command:            $command,
+            target_org:         $target_org,
+            target_repo:        $target_repo,
+            pr_number:          $pr_number,
+            actor:              $actor,
+            issue_title:        $issue_title,
+            target_github_host: $target_github_host,
+            max_cost_review:    $max_cost_review,
+            max_cost_summary:   $max_cost_summary,
+            max_cost_triage:    $max_cost_triage,
+            enqueued_at:        (now | todate),
+            source_run_url:     $source_run_url
+          }'
+        )"
+
+        CONTENT="$(printf '%s' "${PAYLOAD}" | base64 -w0)"
+        COMMIT_MSG="job: ${COMMAND} ${TARGET_ORG}/${TARGET_REPO_NAME}#${PR_NUMBER}"
+
+        # PUT creates the file atomically — no prior SHA needed for new paths
+        HTTP="$(curl -s -o /tmp/_eq_resp.json -w "%{http_code}" \
+          -X PUT \
+          -H "Accept: application/vnd.github+json" \
+          -H "Authorization: Bearer ${QUEUE_TOKEN}" \
+          -H "X-GitHub-Api-Version: 2022-11-28" \
+          "https://api.github.com/repos/${QUEUE_REPO}/contents/${JOB_FILE}" \
+          -d "$(jq -n --arg m "${COMMIT_MSG}" --arg c "${CONTENT}" \
+               '{message: $m, content: $c}')"
+        )"
+
+        if [[ "${HTTP}" != "201" ]]; then
+          echo "::error::Enqueue failed (HTTP ${HTTP}):"
+          cat /tmp/_eq_resp.json >&2
+          exit 1
+        fi
+
+        echo "Enqueued: ${JOB_FILE}"
+        echo "job_file=${JOB_FILE}" >> "${GITHUB_OUTPUT}"
+
+    # ── 3. Acknowledge the user ───────────────────────────────────────────────
+    - name: 'Acknowledge'
+      shell: bash
+      env:
+        GITHUB_TOKEN: '${{ github.token }}'
+        ISSUE_NUMBER: '${{ github.event.issue.number }}'
+        REPOSITORY:   '${{ github.repository }}'
+        ACTOR:        '${{ github.actor }}'
+        JOB_FILE:     '${{ steps.enqueue.outputs.job_file }}'
+        COMMAND:      '${{ steps.parse.outputs.command }}'
+      run: |
+        set -euo pipefail
+        BODY="🤖 Hi @${ACTOR}, your \`/${COMMAND}\` request has been queued and will be picked up shortly. (ref: \`${JOB_FILE}\`)"
+        curl -s -L -X POST \
+          -H "Accept: application/vnd.github+json" \
+          -H "Authorization: Bearer ${GITHUB_TOKEN}" \
+          -H "X-GitHub-Api-Version: 2022-11-28" \
+          "https://api.github.com/repos/${REPOSITORY}/issues/${ISSUE_NUMBER}/comments" \
+          -d "$(jq -n --arg body "${BODY}" '{body: $body}')"
+
+branding:
+  icon:  'inbox'
+  color: 'blue'
