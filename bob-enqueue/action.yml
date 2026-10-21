@@ -28,7 +28,7 @@ inputs:
   max_cost_review:
     description: 'Maximum Bobcoins for a /review run.'
     required: false
-    default: '5'
+    default: '20'
 
   max_cost_summary:
     description: 'Maximum Bobcoins for a /summary run.'
